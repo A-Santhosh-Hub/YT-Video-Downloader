@@ -1,161 +1,114 @@
 import os
+import sys
 import json
-import re
 import yt_dlp
-from flask import Flask, request, jsonify, render_template, send_from_directory, Response
+from flask import Flask, request, jsonify, render_template, Response, stream_with_context
 
-# --- App Initialization ---
-# The 'template_folder' is set to 'templates' to match our new folder structure.
-app = Flask(__name__, template_folder='templates')
+# Create a 'downloads' folder if it doesn't exist
+if not os.path.exists('downloads'):
+    os.makedirs('downloads')
 
-# --- Constants ---
-DOWNLOAD_FOLDER = 'downloads'
-HISTORY_FILE = 'download_history.json'
+app = Flask(__name__, static_folder='static', template_folder='templates')
 
-# --- Initial Setup ---
-# Create the download folder if it doesn't exist
-if not os.path.exists(DOWNLOAD_FOLDER):
-    os.makedirs(DOWNLOAD_FOLDER)
+def get_video_info(url):
+    """Fetches video information and formats."""
+    ydl_opts = {'quiet': True, 'no_warnings': True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        meta = ydl.extract_info(url, download=False)
+        return meta
 
-# --- Helper Functions ---
-def get_download_history():
-    """Reads the download history from a JSON file."""
-    if not os.path.exists(HISTORY_FILE):
-        return []
-    try:
-        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        return []
-
-def save_download_history(history):
-    """Saves the download history to a JSON file."""
-    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-        json.dump(history, f, indent=4)
-
-# --- App Routes ---
 @app.route('/')
 def index():
-    """Renders the main HTML page from the 'templates' folder."""
+    """Serve the main HTML page."""
     return render_template('index.html')
 
-@app.route('/get_video_info', methods=['POST'])
-def get_video_info():
-    """
-    Fetches detailed video information including title, thumbnail, and available resolutions.
-    """
+@app.route('/api/get-formats', methods=['POST'])
+def get_formats_api():
+    """API endpoint to fetch available video formats."""
     url = request.json.get('url')
     if not url:
         return jsonify({'error': 'URL is required'}), 400
 
     try:
-        ydl_opts = {'noplaylist': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            # Get all unique video resolutions available
-            resolutions = set()
-            for f in info.get('formats', []):
-                if f.get('height'):
-                    resolutions.add(f['height'])
+        info = get_video_info(url)
+        formats = []
+        for f in info.get('formats', []):
+            # Filter for video formats that have a resolution
+            if f.get('vcodec') != 'none' and f.get('height'):
+                filesize_mb = f.get('filesize')
+                if filesize_mb:
+                    filesize_mb = f"{filesize_mb / (1024*1024):.1f} MB"
+                else:
+                    filesize_mb = "N/A"
+                
+                formats.append({
+                    'format_id': f['format_id'],
+                    'resolution': f'{f["height"]}p',
+                    'ext': f['ext'],
+                    'fps': f.get('fps'),
+                    'filesize': filesize_mb,
+                })
+        
+        # Sort by height descending
+        formats.sort(key=lambda x: int(x['resolution'][:-1]), reverse=True)
 
-            return jsonify({
-                'title': info.get('title'),
-                'thumbnail': info.get('thumbnail'),
-                # Send a sorted list of resolutions
-                'resolutions': sorted(list(resolutions), reverse=True)
-            })
+        return jsonify({
+            'title': info.get('title', 'No title'),
+            'thumbnail': info.get('thumbnail', ''),
+            'formats': formats
+        })
+    except yt_dlp.utils.DownloadError as e:
+        return jsonify({'error': f'Invalid URL or video not found: {str(e)}'}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
 
-@app.route('/download_video', methods=['POST'])
-def download_video():
-    """
-    Downloads a video by selecting the best video and audio for the chosen resolution
-    and merging them together.
-    """
-    url = request.json.get('url')
-    resolution = request.json.get('resolution')
-    title = request.json.get('title')
-    thumbnail = request.json.get('thumbnail')
+@app.route('/api/download')
+def download_video_api():
+    """API endpoint to download the video and stream progress."""
+    url = request.args.get('url')
+    format_id = request.args.get('format_id')
 
-    if not all([url, resolution, title, thumbnail]):
-        return jsonify({'error': 'URL, resolution, title, and thumbnail are required'}), 400
+    if not url or not format_id:
+        return Response(json.dumps({'error': 'URL and Format ID are required'}), status=400, mimetype='application/json')
 
-    try:
-        # Define a clean output filename template
-        output_template = os.path.join(DOWNLOAD_FOLDER, '%(title)s [%(id)s].%(ext)s')
-        
-        # This format string tells yt-dlp to find the best video at the chosen
-        # resolution (or lower) and the best audio, and merge them.
-        # It defaults to mp4 format.
-        format_selector = f"bestvideo[height<={resolution}]+bestaudio/best[ext=mp4]/best"
-        
+    def generate_progress():
+        """Generator function to stream download progress."""
+        def progress_hook(d):
+            if d['status'] == 'downloading':
+                progress_data = {
+                    'status': 'downloading',
+                    'percent': d.get('_percent_str', '0%').strip(),
+                    'total_bytes': d.get('_total_bytes_str', 'N/A').strip(),
+                    'speed': d.get('_speed_str', 'N/A').strip(),
+                    'eta': d.get('_eta_str', 'N/A').strip()
+                }
+                # SSE format: "data: {json_string}\n\n"
+                yield f"data: {json.dumps(progress_data)}\n\n"
+
         ydl_opts = {
-            'format': format_selector,
-            'outtmpl': output_template,
-            'merge_output_format': 'mp4', # Ensures the final file is mp4
+            'format': format_id,
+            'progress_hooks': [progress_hook],
+            'outtmpl': 'downloads/%(title)s.%(ext)s',
+            'merge_output_format': 'mp4',
+            'noprogress': True, # Disable default progress bar
+            'quiet': True,
+            'no_warnings': True
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # Get the final filename after download and potential merge
-            filename = ydl.prepare_filename(info)
 
-            # Add to history with more details
-            history = get_download_history()
-            history.insert(0, {
-                'title': title, 
-                'filename': os.path.basename(filename),
-                'thumbnail': thumbnail
-            })
-            save_download_history(history)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            
+            # Send final status
+            finished_data = {'status': 'finished', 'message': '✅ Download complete!'}
+            yield f"data: {json.dumps(finished_data)}\n\n"
 
-            return jsonify({'message': 'Download complete!', 'filename': os.path.basename(filename)})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        except Exception as e:
+            error_data = {'status': 'error', 'message': f'❌ Download failed: {str(e)}'}
+            yield f"data: {json.dumps(error_data)}\n\n"
 
-@app.route('/history')
-def history():
-    """Returns the download history."""
-    return jsonify(get_download_history())
-
-@app.route('/play/<path:filename>')
-def play_file(filename):
-    """Streams a downloaded video file for playback in the browser."""
-    video_path = os.path.join(DOWNLOAD_FOLDER, filename)
-    if not os.path.exists(video_path):
-        return "File not found", 404
-    
-    range_header = request.headers.get('Range', None)
-    size = os.path.getsize(video_path)
-    
-    if not range_header:
-        # If no range header, send the whole file
-        with open(video_path, 'rb') as f:
-            data = f.read()
-        return Response(data, mimetype='video/mp4', headers={'Content-Length': str(size)})
-
-    # Handle byte range requests for seeking
-    byte1, byte2 = 0, None
-    m = re.search(r'(\d+)-(\d*)', range_header)
-    g = m.groups()
-
-    if g[0]: byte1 = int(g[0])
-    if g[1]: byte2 = int(g[1])
-
-    length = size - byte1
-    if byte2 is not None:
-        length = byte2 - byte1 + 1
-    
-    data = None
-    with open(video_path, 'rb') as f:
-        f.seek(byte1)
-        data = f.read(length)
-
-    rv = Response(data, 206, mimetype='video/mp4', content_type='video/mp4', direct_passthrough=True)
-    rv.headers.add('Content-Range', f'bytes {byte1}-{byte1 + length - 1}/{size}')
-    return rv
-
+    # Use Server-Sent Events (SSE) to stream progress
+    return Response(stream_with_context(generate_progress()), mimetype='text/event-stream')
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0')
